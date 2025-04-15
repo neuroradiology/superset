@@ -17,6 +17,7 @@
   under the License.
 #}
 {% import 'appbuilder/general/lib.html' as lib %}
+{% import "superset/macros.html" as macros %}
 
 <div class="list-search-container">
     <form id="filter_form" class="form-search" method="get">
@@ -37,38 +38,39 @@
             </table>
             <div class="filter-action" style="display:none">
             <button type="submit" class="btn btn-sm btn-primary" id="search-action">
-                Search&nbsp;&nbsp;<i class="fa fa-search"></i>
+                {{_("Search")}}&nbsp;&nbsp;<i class="fa fa-search"></i>
             </button>
             </div>
         </div>
     </form>
 </div>
 
-<script>
-(function($) {
-    function checkSearchButton() {
-        var hasFilter = $('.filters tr').length;
-        if (hasFilter) {
-            $('.filters a.remove-filter').off('click', checkSearchButton);
-            $('.filters a.remove-filter').on('click', checkSearchButton);
-            $('.filter-action').toggle(true);
-        } else {
-            $('.filter-action').toggle(false);
+<script nonce="{{ macros.get_nonce() }}">
+    (function($) {
+        function checkSearchButton() {
+            var hasFilter = $('.filters tr').length;
+            if (hasFilter) {
+                $('.filters a.remove-filter').off('click', checkSearchButton);
+                $('.filters a.remove-filter').on('click', checkSearchButton);
+                $('.filter-action').toggle(true);
+            } else {
+                $('.filter-action').toggle(true);
+                $('.filter-action > button').html('{{_("Refresh")}}&nbsp;&nbsp;<i class="fa fa-refresh"></i>');
+            }
         }
-    }
 
-    $('.list-search-container').on('hidden.bs.dropdown', checkSearchButton);
-    $(document).ready(function() {
-        checkSearchButton();
-    });
+        $('a.btn.remove-filter').on('click', checkSearchButton);
+        $(document).ready(function() {
+            checkSearchButton();
+        });
 
-    var filter = new AdminFilters(
-        '#filter_form',
-        {{ label_columns | tojson | safe }},
-        {{ form_fields | tojson | safe }},
-        {{ search_filters | tojson | safe }},
-        {{ active_filters | tojson | safe }}
-    );
-})(jQuery);
+        var filter = new AdminFilters(
+            '#filter_form',
+            {{ label_columns | tojson | safe }},
+            {{ form_fields | tojson | safe }},
+            {{ search_filters | tojson | safe }},
+            {{ active_filters | tojson | safe }}
+        );
+    })(jQuery);
 
 </script>

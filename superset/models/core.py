@@ -14,1264 +14,1217 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-# pylint: disable=C,R,W
+
+# pylint: disable=too-many-lines, too-many-arguments
+
 """A collection of ORM sqlalchemy models for Superset"""
-from contextlib import closing
-from copy import copy, deepcopy
-from datetime import datetime
-import functools
-import json
+
+from __future__ import annotations
+
+import builtins
 import logging
 import textwrap
+from ast import literal_eval
+from contextlib import closing, contextmanager, nullcontext, suppress
+from copy import deepcopy
+from datetime import datetime
+from functools import lru_cache
+from inspect import signature
+from typing import Any, Callable, cast, TYPE_CHECKING
 
-from flask import escape, g, Markup, request
-from flask_appbuilder import Model
-from flask_appbuilder.models.decorators import renders
-from flask_appbuilder.security.sqla.models import User
 import numpy
 import pandas as pd
 import sqlalchemy as sqla
+import sshtunnel
+from flask import g
+from flask_appbuilder import Model
+from marshmallow.exceptions import ValidationError
 from sqlalchemy import (
-    Boolean, Column, create_engine, DateTime, ForeignKey, Integer,
-    MetaData, String, Table, Text,
+    Boolean,
+    Column,
+    create_engine,
+    DateTime,
+    ForeignKey,
+    Integer,
+    MetaData,
+    String,
+    Table as SqlaTable,
+    Text,
 )
-from sqlalchemy.engine import url
-from sqlalchemy.engine.url import make_url
-from sqlalchemy.orm import relationship, sessionmaker, subqueryload
-from sqlalchemy.orm.session import make_transient
+from sqlalchemy.engine import Connection, Dialect, Engine
+from sqlalchemy.engine.reflection import Inspector
+from sqlalchemy.engine.url import URL
+from sqlalchemy.exc import NoSuchModuleError
+from sqlalchemy.ext.hybrid import hybrid_property
+from sqlalchemy.orm import relationship
 from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import UniqueConstraint
-from sqlalchemy_utils import EncryptedType
-import sqlparse
+from sqlalchemy.sql import ColumnElement, expression, Select
 
-from superset import app, db, db_engine_specs, security_manager
-from superset.connectors.connector_registry import ConnectorRegistry
-from superset.legacy import update_time_range
-from superset.models.helpers import AuditMixinNullable, ImportMixin
-from superset.models.tags import ChartUpdater, DashboardUpdater, FavStarUpdater
-from superset.models.user_attributes import UserAttribute
-from superset.utils import (
-    cache as cache_util,
-    core as utils,
+from superset import app, db, db_engine_specs, is_feature_enabled
+from superset.commands.database.exceptions import DatabaseInvalidError
+from superset.constants import LRU_CACHE_MAX_SIZE, PASSWORD_MASK
+from superset.databases.utils import make_url_safe
+from superset.db_engine_specs.base import MetricType, TimeGrain
+from superset.extensions import (
+    cache_manager,
+    encrypted_field_factory,
+    event_logger,
+    security_manager,
+    ssh_manager_factory,
 )
-from superset.viz import viz_types
-from urllib import parse  # noqa
+from superset.models.helpers import AuditMixinNullable, ImportExportMixin, UUIDMixin
+from superset.result_set import SupersetResultSet
+from superset.sql.parse import SQLScript
+from superset.sql_parse import Table
+from superset.superset_typing import (
+    DbapiDescription,
+    OAuth2ClientConfig,
+    ResultSetColumnType,
+)
+from superset.utils import cache as cache_util, core as utils, json
+from superset.utils.backports import StrEnum
+from superset.utils.core import get_query_source_from_request, get_username
+from superset.utils.oauth2 import (
+    check_for_oauth2,
+    get_oauth2_access_token,
+    OAuth2ClientConfigSchema,
+)
 
 config = app.config
-custom_password_store = config.get('SQLALCHEMY_CUSTOM_PASSWORD_STORE')
-stats_logger = config.get('STATS_LOGGER')
-log_query = config.get('QUERY_LOGGER')
+custom_password_store = config["SQLALCHEMY_CUSTOM_PASSWORD_STORE"]
+stats_logger = config["STATS_LOGGER"]
+log_query = config["QUERY_LOGGER"]
 metadata = Model.metadata  # pylint: disable=no-member
+logger = logging.getLogger(__name__)
 
-PASSWORD_MASK = 'X' * 10
+if TYPE_CHECKING:
+    from superset.databases.ssh_tunnel.models import SSHTunnel
+    from superset.models.sql_lab import Query
 
-def set_related_perm(mapper, connection, target):  # noqa
-    src_class = target.cls_model
-    id_ = target.datasource_id
-    if id_:
-        ds = db.session.query(src_class).filter_by(id=int(id_)).first()
-        if ds:
-            target.perm = ds.perm
+DB_CONNECTION_MUTATOR = config["DB_CONNECTION_MUTATOR"]
 
 
-def copy_dashboard(mapper, connection, target):
-    dashboard_id = config.get('DASHBOARD_TEMPLATE_ID')
-    if dashboard_id is None:
-        return
-
-    Session = sessionmaker(autoflush=False)
-    session = Session(bind=connection)
-    new_user = session.query(User).filter_by(id=target.id).first()
-
-    # copy template dashboard to user
-    template = session.query(Dashboard).filter_by(id=int(dashboard_id)).first()
-    dashboard = Dashboard(
-        dashboard_title=template.dashboard_title,
-        position_json=template.position_json,
-        description=template.description,
-        css=template.css,
-        json_metadata=template.json_metadata,
-        slices=template.slices,
-        owners=[new_user],
-    )
-    session.add(dashboard)
-    session.commit()
-
-    # set dashboard as the welcome dashboard
-    extra_attributes = UserAttribute(
-        user_id=target.id,
-        welcome_dashboard_id=dashboard.id,
-    )
-    session.add(extra_attributes)
-    session.commit()
-
-
-sqla.event.listen(User, 'after_insert', copy_dashboard)
-
-
-class Url(Model, AuditMixinNullable):
-    """Used for the short url feature"""
-
-    __tablename__ = 'url'
-    id = Column(Integer, primary_key=True)
-    url = Column(Text)
-
-
-class KeyValue(Model):
-
+class KeyValue(Model):  # pylint: disable=too-few-public-methods
     """Used for any type of key-value store"""
 
-    __tablename__ = 'keyvalue'
+    __tablename__ = "keyvalue"
     id = Column(Integer, primary_key=True)
-    value = Column(Text, nullable=False)
+    value = Column(utils.MediumText(), nullable=False)
 
 
-class CssTemplate(Model, AuditMixinNullable):
-
+class CssTemplate(AuditMixinNullable, UUIDMixin, Model):
     """CSS templates for dashboards"""
 
-    __tablename__ = 'css_templates'
+    __tablename__ = "css_templates"
     id = Column(Integer, primary_key=True)
     template_name = Column(String(250))
-    css = Column(Text, default='')
+    css = Column(utils.MediumText(), default="")
 
 
-slice_user = Table('slice_user', metadata,
-                   Column('id', Integer, primary_key=True),
-                   Column('user_id', Integer, ForeignKey('ab_user.id')),
-                   Column('slice_id', Integer, ForeignKey('slices.id')))
+class ConfigurationMethod(StrEnum):
+    SQLALCHEMY_FORM = "sqlalchemy_form"
+    DYNAMIC_FORM = "dynamic_form"
 
 
-class Slice(Model, AuditMixinNullable, ImportMixin):
-
-    """A slice is essentially a report or a view on data"""
-
-    __tablename__ = 'slices'
-    id = Column(Integer, primary_key=True)
-    slice_name = Column(String(250))
-    datasource_id = Column(Integer)
-    datasource_type = Column(String(200))
-    datasource_name = Column(String(2000))
-    viz_type = Column(String(250))
-    params = Column(Text)
-    description = Column(Text)
-    cache_timeout = Column(Integer)
-    perm = Column(String(1000))
-    owners = relationship(security_manager.user_model, secondary=slice_user)
-
-    export_fields = ('slice_name', 'datasource_type', 'datasource_name',
-                     'viz_type', 'params', 'cache_timeout')
-
-    def __repr__(self):
-        return self.slice_name
-
-    @property
-    def cls_model(self):
-        return ConnectorRegistry.sources[self.datasource_type]
-
-    @property
-    def datasource(self):
-        return self.get_datasource
-
-    def clone(self):
-        return Slice(
-            slice_name=self.slice_name,
-            datasource_id=self.datasource_id,
-            datasource_type=self.datasource_type,
-            datasource_name=self.datasource_name,
-            viz_type=self.viz_type,
-            params=self.params,
-            description=self.description,
-            cache_timeout=self.cache_timeout)
-
-    @datasource.getter
-    @utils.memoized
-    def get_datasource(self):
-        return (
-            db.session.query(self.cls_model)
-            .filter_by(id=self.datasource_id)
-            .first()
-        )
-
-    @renders('datasource_name')
-    def datasource_link(self):
-        # pylint: disable=no-member
-        datasource = self.datasource
-        return datasource.link if datasource else None
-
-    def datasource_name_text(self):
-        # pylint: disable=no-member
-        datasource = self.datasource
-        return datasource.name if datasource else None
-
-    @property
-    def datasource_edit_url(self):
-        # pylint: disable=no-member
-        datasource = self.datasource
-        return datasource.url if datasource else None
-
-    @property
-    @utils.memoized
-    def viz(self):
-        d = json.loads(self.params)
-        viz_class = viz_types[self.viz_type]
-        # pylint: disable=no-member
-        return viz_class(datasource=self.datasource, form_data=d)
-
-    @property
-    def description_markeddown(self):
-        return utils.markdown(self.description)
-
-    @property
-    def data(self):
-        """Data used to render slice in templates"""
-        d = {}
-        self.token = ''
-        try:
-            d = self.viz.data
-            self.token = d.get('token')
-        except Exception as e:
-            logging.exception(e)
-            d['error'] = str(e)
-        return {
-            'datasource': self.datasource_name,
-            'description': self.description,
-            'description_markeddown': self.description_markeddown,
-            'edit_url': self.edit_url,
-            'form_data': self.form_data,
-            'slice_id': self.id,
-            'slice_name': self.slice_name,
-            'slice_url': self.slice_url,
-            'modified': self.modified(),
-            'changed_on': self.changed_on.isoformat(),
-        }
-
-    @property
-    def json_data(self):
-        return json.dumps(self.data)
-
-    @property
-    def form_data(self):
-        form_data = {}
-        try:
-            form_data = json.loads(self.params)
-        except Exception as e:
-            logging.error("Malformed json in slice's params")
-            logging.exception(e)
-        form_data.update({
-            'slice_id': self.id,
-            'viz_type': self.viz_type,
-            'datasource': '{}__{}'.format(
-                self.datasource_id, self.datasource_type),
-        })
-
-        if self.cache_timeout:
-            form_data['cache_timeout'] = self.cache_timeout
-        update_time_range(form_data)
-        return form_data
-
-    def get_explore_url(self, base_url='/superset/explore', overrides=None):
-        overrides = overrides or {}
-        form_data = {'slice_id': self.id}
-        form_data.update(overrides)
-        params = parse.quote(json.dumps(form_data))
-        return f'{base_url}/?form_data={params}'
-
-    @property
-    def slice_url(self):
-        """Defines the url to access the slice"""
-        return self.get_explore_url()
-
-    @property
-    def explore_json_url(self):
-        """Defines the url to access the slice"""
-        return self.get_explore_url('/superset/explore_json')
-
-    @property
-    def edit_url(self):
-        return '/chart/edit/{}'.format(self.id)
-
-    @property
-    def slice_link(self):
-        url = self.slice_url
-        name = escape(self.slice_name)
-        return Markup(f'<a href="{url}">{name}</a>')
-
-    def get_viz(self, force=False):
-        """Creates :py:class:viz.BaseViz object from the url_params_multidict.
-
-        :return: object of the 'viz_type' type that is taken from the
-            url_params_multidict or self.params.
-        :rtype: :py:class:viz.BaseViz
-        """
-        slice_params = json.loads(self.params)
-        slice_params['slice_id'] = self.id
-        slice_params['json'] = 'false'
-        slice_params['slice_name'] = self.slice_name
-        slice_params['viz_type'] = self.viz_type if self.viz_type else 'table'
-
-        return viz_types[slice_params.get('viz_type')](
-            self.datasource,
-            form_data=slice_params,
-            force=force,
-        )
-
-    @property
-    def icons(self):
-        return f"""
-        <a
-                href="{self.datasource_edit_url}"
-                data-toggle="tooltip"
-                title="{self.datasource}">
-            <i class="fa fa-database"></i>
-        </a>
-        """
-
-    @classmethod
-    def import_obj(cls, slc_to_import, slc_to_override, import_time=None):
-        """Inserts or overrides slc in the database.
-
-        remote_id and import_time fields in params_dict are set to track the
-        slice origin and ensure correct overrides for multiple imports.
-        Slice.perm is used to find the datasources and connect them.
-
-        :param Slice slc_to_import: Slice object to import
-        :param Slice slc_to_override: Slice to replace, id matches remote_id
-        :returns: The resulting id for the imported slice
-        :rtype: int
-        """
-        session = db.session
-        make_transient(slc_to_import)
-        slc_to_import.dashboards = []
-        slc_to_import.alter_params(
-            remote_id=slc_to_import.id, import_time=import_time)
-
-        slc_to_import = slc_to_import.copy()
-        params = slc_to_import.params_dict
-        slc_to_import.datasource_id = ConnectorRegistry.get_datasource_by_name(
-            session, slc_to_import.datasource_type, params['datasource_name'],
-            params['schema'], params['database_name']).id
-        if slc_to_override:
-            slc_to_override.override(slc_to_import)
-            session.flush()
-            return slc_to_override.id
-        session.add(slc_to_import)
-        logging.info('Final slice: {}'.format(slc_to_import.to_json()))
-        session.flush()
-        return slc_to_import.id
-
-    @property
-    def url(self):
-        return (
-            '/superset/explore/?form_data=%7B%22slice_id%22%3A%20{0}%7D'
-            .format(self.id)
-        )
-
-
-sqla.event.listen(Slice, 'before_insert', set_related_perm)
-sqla.event.listen(Slice, 'before_update', set_related_perm)
-
-
-dashboard_slices = Table(
-    'dashboard_slices', metadata,
-    Column('id', Integer, primary_key=True),
-    Column('dashboard_id', Integer, ForeignKey('dashboards.id')),
-    Column('slice_id', Integer, ForeignKey('slices.id')),
-)
-
-dashboard_user = Table(
-    'dashboard_user', metadata,
-    Column('id', Integer, primary_key=True),
-    Column('user_id', Integer, ForeignKey('ab_user.id')),
-    Column('dashboard_id', Integer, ForeignKey('dashboards.id')),
-)
-
-
-class Dashboard(Model, AuditMixinNullable, ImportMixin):
-
-    """The dashboard object!"""
-
-    __tablename__ = 'dashboards'
-    id = Column(Integer, primary_key=True)
-    dashboard_title = Column(String(500))
-    position_json = Column(utils.MediumText())
-    description = Column(Text)
-    css = Column(Text)
-    json_metadata = Column(Text)
-    slug = Column(String(255), unique=True)
-    slices = relationship(
-        'Slice', secondary=dashboard_slices, backref='dashboards')
-    owners = relationship(security_manager.user_model, secondary=dashboard_user)
-
-    export_fields = ('dashboard_title', 'position_json', 'json_metadata',
-                     'description', 'css', 'slug')
-
-    def __repr__(self):
-        return self.dashboard_title
-
-    @property
-    def table_names(self):
-        # pylint: disable=no-member
-        return ', '.join(
-            {'{}'.format(s.datasource.full_name) for s in self.slices})
-
-    @property
-    def url(self):
-        if self.json_metadata:
-            # add default_filters to the preselect_filters of dashboard
-            json_metadata = json.loads(self.json_metadata)
-            default_filters = json_metadata.get('default_filters')
-            # make sure default_filters is not empty and is valid
-            if default_filters and default_filters != '{}':
-                try:
-                    if json.loads(default_filters):
-                        filters = parse.quote(default_filters.encode('utf8'))
-                        return '/superset/dashboard/{}/?preselect_filters={}'.format(
-                            self.slug or self.id, filters)
-                except Exception:
-                    pass
-        return '/superset/dashboard/{}/'.format(self.slug or self.id)
-
-    @property
-    def datasources(self):
-        return {slc.datasource for slc in self.slices}
-
-    @property
-    def sqla_metadata(self):
-        # pylint: disable=no-member
-        metadata = MetaData(bind=self.get_sqla_engine())
-        return metadata.reflect()
-
-    def dashboard_link(self):
-        title = escape(self.dashboard_title)
-        return Markup(f'<a href="{self.url}">{title}</a>')
-
-    @property
-    def data(self):
-        positions = self.position_json
-        if positions:
-            positions = json.loads(positions)
-        return {
-            'id': self.id,
-            'metadata': self.params_dict,
-            'css': self.css,
-            'dashboard_title': self.dashboard_title,
-            'slug': self.slug,
-            'slices': [slc.data for slc in self.slices],
-            'position_json': positions,
-        }
-
-    @property
-    def params(self):
-        return self.json_metadata
-
-    @params.setter
-    def params(self, value):
-        self.json_metadata = value
-
-    @property
-    def position(self):
-        if self.position_json:
-            return json.loads(self.position_json)
-        return {}
-
-    @classmethod
-    def import_obj(cls, dashboard_to_import, import_time=None):
-        """Imports the dashboard from the object to the database.
-
-         Once dashboard is imported, json_metadata field is extended and stores
-         remote_id and import_time. It helps to decide if the dashboard has to
-         be overridden or just copies over. Slices that belong to this
-         dashboard will be wired to existing tables. This function can be used
-         to import/export dashboards between multiple superset instances.
-         Audit metadata isn't copied over.
-        """
-        def alter_positions(dashboard, old_to_new_slc_id_dict):
-            """ Updates slice_ids in the position json.
-
-            Sample position_json data:
-            {
-                "DASHBOARD_VERSION_KEY": "v2",
-                "DASHBOARD_ROOT_ID": {
-                    "type": "DASHBOARD_ROOT_TYPE",
-                    "id": "DASHBOARD_ROOT_ID",
-                    "children": ["DASHBOARD_GRID_ID"]
-                },
-                "DASHBOARD_GRID_ID": {
-                    "type": "DASHBOARD_GRID_TYPE",
-                    "id": "DASHBOARD_GRID_ID",
-                    "children": ["DASHBOARD_CHART_TYPE-2"]
-                },
-                "DASHBOARD_CHART_TYPE-2": {
-                    "type": "DASHBOARD_CHART_TYPE",
-                    "id": "DASHBOARD_CHART_TYPE-2",
-                    "children": [],
-                    "meta": {
-                        "width": 4,
-                        "height": 50,
-                        "chartId": 118
-                    }
-                },
-            }
-            """
-            position_data = json.loads(dashboard.position_json)
-            position_json = position_data.values()
-            for value in position_json:
-                if (isinstance(value, dict) and value.get('meta') and
-                        value.get('meta').get('chartId')):
-                    old_slice_id = value.get('meta').get('chartId')
-
-                    if old_slice_id in old_to_new_slc_id_dict:
-                        value['meta']['chartId'] = (
-                            old_to_new_slc_id_dict[old_slice_id]
-                        )
-            dashboard.position_json = json.dumps(position_data)
-
-        logging.info('Started import of the dashboard: {}'
-                     .format(dashboard_to_import.to_json()))
-        session = db.session
-        logging.info('Dashboard has {} slices'
-                     .format(len(dashboard_to_import.slices)))
-        # copy slices object as Slice.import_slice will mutate the slice
-        # and will remove the existing dashboard - slice association
-        slices = copy(dashboard_to_import.slices)
-        old_to_new_slc_id_dict = {}
-        new_filter_immune_slices = []
-        new_timed_refresh_immune_slices = []
-        new_expanded_slices = {}
-        i_params_dict = dashboard_to_import.params_dict
-        remote_id_slice_map = {
-            slc.params_dict['remote_id']: slc
-            for slc in session.query(Slice).all()
-            if 'remote_id' in slc.params_dict
-        }
-        for slc in slices:
-            logging.info('Importing slice {} from the dashboard: {}'.format(
-                slc.to_json(), dashboard_to_import.dashboard_title))
-            remote_slc = remote_id_slice_map.get(slc.id)
-            new_slc_id = Slice.import_obj(slc, remote_slc, import_time=import_time)
-            old_to_new_slc_id_dict[slc.id] = new_slc_id
-            # update json metadata that deals with slice ids
-            new_slc_id_str = '{}'.format(new_slc_id)
-            old_slc_id_str = '{}'.format(slc.id)
-            if ('filter_immune_slices' in i_params_dict and
-                    old_slc_id_str in i_params_dict['filter_immune_slices']):
-                new_filter_immune_slices.append(new_slc_id_str)
-            if ('timed_refresh_immune_slices' in i_params_dict and
-                    old_slc_id_str in
-                    i_params_dict['timed_refresh_immune_slices']):
-                new_timed_refresh_immune_slices.append(new_slc_id_str)
-            if ('expanded_slices' in i_params_dict and
-                    old_slc_id_str in i_params_dict['expanded_slices']):
-                new_expanded_slices[new_slc_id_str] = (
-                    i_params_dict['expanded_slices'][old_slc_id_str])
-
-        # override the dashboard
-        existing_dashboard = None
-        for dash in session.query(Dashboard).all():
-            if ('remote_id' in dash.params_dict and
-                    dash.params_dict['remote_id'] ==
-                    dashboard_to_import.id):
-                existing_dashboard = dash
-
-        dashboard_to_import.id = None
-        alter_positions(dashboard_to_import, old_to_new_slc_id_dict)
-        dashboard_to_import.alter_params(import_time=import_time)
-        if new_expanded_slices:
-            dashboard_to_import.alter_params(
-                expanded_slices=new_expanded_slices)
-        if new_filter_immune_slices:
-            dashboard_to_import.alter_params(
-                filter_immune_slices=new_filter_immune_slices)
-        if new_timed_refresh_immune_slices:
-            dashboard_to_import.alter_params(
-                timed_refresh_immune_slices=new_timed_refresh_immune_slices)
-
-        new_slices = session.query(Slice).filter(
-            Slice.id.in_(old_to_new_slc_id_dict.values())).all()
-
-        if existing_dashboard:
-            existing_dashboard.override(dashboard_to_import)
-            existing_dashboard.slices = new_slices
-            session.flush()
-            return existing_dashboard.id
-        else:
-            # session.add(dashboard_to_import) causes sqlachemy failures
-            # related to the attached users / slices. Creating new object
-            # allows to avoid conflicts in the sql alchemy state.
-            copied_dash = dashboard_to_import.copy()
-            copied_dash.slices = new_slices
-            session.add(copied_dash)
-            session.flush()
-            return copied_dash.id
-
-    @classmethod
-    def export_dashboards(cls, dashboard_ids):
-        copied_dashboards = []
-        datasource_ids = set()
-        for dashboard_id in dashboard_ids:
-            # make sure that dashboard_id is an integer
-            dashboard_id = int(dashboard_id)
-            copied_dashboard = (
-                db.session.query(Dashboard)
-                .options(subqueryload(Dashboard.slices))
-                .filter_by(id=dashboard_id).first()
-            )
-            make_transient(copied_dashboard)
-            for slc in copied_dashboard.slices:
-                datasource_ids.add((slc.datasource_id, slc.datasource_type))
-                # add extra params for the import
-                slc.alter_params(
-                    remote_id=slc.id,
-                    datasource_name=slc.datasource.name,
-                    schema=slc.datasource.name,
-                    database_name=slc.datasource.database.name,
-                )
-            copied_dashboard.alter_params(remote_id=dashboard_id)
-            copied_dashboards.append(copied_dashboard)
-
-            eager_datasources = []
-            for dashboard_id, dashboard_type in datasource_ids:
-                eager_datasource = ConnectorRegistry.get_eager_datasource(
-                    db.session, dashboard_type, dashboard_id)
-                eager_datasource.alter_params(
-                    remote_id=eager_datasource.id,
-                    database_name=eager_datasource.database.name,
-                )
-                make_transient(eager_datasource)
-                eager_datasources.append(eager_datasource)
-
-        return json.dumps({
-            'dashboards': copied_dashboards,
-            'datasources': eager_datasources,
-        }, cls=utils.DashboardEncoder, indent=4)
-
-
-class Database(Model, AuditMixinNullable, ImportMixin):
-
+class Database(Model, AuditMixinNullable, ImportExportMixin):  # pylint: disable=too-many-public-methods
     """An ORM object that stores Database related information"""
 
-    __tablename__ = 'dbs'
-    type = 'table'
-    __table_args__ = (UniqueConstraint('database_name'),)
+    __tablename__ = "dbs"
+    type = "table"
+    __table_args__ = (UniqueConstraint("database_name"),)
 
     id = Column(Integer, primary_key=True)
     verbose_name = Column(String(250), unique=True)
     # short unique name, used in permissions
-    database_name = Column(String(250), unique=True)
-    sqlalchemy_uri = Column(String(1024))
-    password = Column(EncryptedType(String(1024), config.get('SECRET_KEY')))
+    database_name = Column(String(250), unique=True, nullable=False)
+    sqlalchemy_uri = Column(String(1024), nullable=False)
+    password = Column(encrypted_field_factory.create(String(1024)))
     cache_timeout = Column(Integer)
     select_as_create_table_as = Column(Boolean, default=False)
     expose_in_sqllab = Column(Boolean, default=True)
+    configuration_method = Column(
+        String(255), server_default=ConfigurationMethod.SQLALCHEMY_FORM.value
+    )
     allow_run_async = Column(Boolean, default=False)
-    allow_csv_upload = Column(Boolean, default=False)
+    allow_file_upload = Column(Boolean, default=False)
     allow_ctas = Column(Boolean, default=False)
+    allow_cvas = Column(Boolean, default=False)
     allow_dml = Column(Boolean, default=False)
     force_ctas_schema = Column(String(250))
-    allow_multi_schema_metadata_fetch = Column(Boolean, default=False)
-    extra = Column(Text, default=textwrap.dedent("""\
+    extra = Column(
+        Text,
+        default=textwrap.dedent(
+            """\
     {
         "metadata_params": {},
         "engine_params": {},
         "metadata_cache_timeout": {},
-        "schemas_allowed_for_csv_upload": []
+        "schemas_allowed_for_file_upload": []
     }
-    """))
-    perm = Column(String(1000))
+    """
+        ),
+    )
+    encrypted_extra = Column(encrypted_field_factory.create(Text), nullable=True)
     impersonate_user = Column(Boolean, default=False)
-    export_fields = ('database_name', 'sqlalchemy_uri', 'cache_timeout',
-                     'expose_in_sqllab', 'allow_run_async',
-                     'allow_ctas', 'allow_csv_upload', 'extra')
-    export_children = ['tables']
+    server_cert = Column(encrypted_field_factory.create(Text), nullable=True)
+    is_managed_externally = Column(Boolean, nullable=False, default=False)
+    external_url = Column(Text, nullable=True)
 
-    def __repr__(self):
+    export_fields = [
+        "database_name",
+        "sqlalchemy_uri",
+        "cache_timeout",
+        "expose_in_sqllab",
+        "allow_run_async",
+        "allow_ctas",
+        "allow_cvas",
+        "allow_dml",
+        "allow_file_upload",
+        "extra",
+        "impersonate_user",
+    ]
+    extra_import_fields = [
+        "password",
+        "is_managed_externally",
+        "external_url",
+        "encrypted_extra",
+        "impersonate_user",
+    ]
+    export_children = ["tables"]
+
+    def __repr__(self) -> str:
+        return self.name
+
+    @property
+    def name(self) -> str:
         return self.verbose_name if self.verbose_name else self.database_name
 
     @property
-    def name(self):
-        return self.verbose_name if self.verbose_name else self.database_name
+    def allows_subquery(self) -> bool:
+        return self.db_engine_spec.allows_subqueries
 
     @property
-    def allows_subquery(self):
-        return self.db_engine_spec.allows_subquery
+    def function_names(self) -> list[str]:
+        try:
+            return self.db_engine_spec.get_function_names(self)
+        except Exception as ex:  # pylint: disable=broad-except
+            # function_names property is used in bulk APIs and should not hard crash
+            # more info in: https://github.com/apache/superset/issues/9678
+            logger.error(
+                "Failed to fetch database function names with error: %s",
+                str(ex),
+                exc_info=True,
+            )
+        return []
 
     @property
-    def data(self):
+    def allows_cost_estimate(self) -> bool:
+        extra = self.get_extra() or {}
+        cost_estimate_enabled: bool = extra.get("cost_estimate_enabled")  # type: ignore
+
+        return (
+            self.db_engine_spec.get_allow_cost_estimate(extra) and cost_estimate_enabled
+        )
+
+    @property
+    def allows_virtual_table_explore(self) -> bool:
+        extra = self.get_extra()
+        return bool(extra.get("allows_virtual_table_explore", True))
+
+    @property
+    def explore_database_id(self) -> int:
+        return self.get_extra().get("explore_database_id", self.id)
+
+    @property
+    def disable_data_preview(self) -> bool:
+        # this will prevent any 'trash value' strings from going through
+        return self.get_extra().get("disable_data_preview", False) is True
+
+    @property
+    def disable_drill_to_detail(self) -> bool:
+        # this will prevent any 'trash value' strings from going through
+        return self.get_extra().get("disable_drill_to_detail", False) is True
+
+    @property
+    def allow_multi_catalog(self) -> bool:
+        return self.get_extra().get("allow_multi_catalog", False)
+
+    @property
+    def schema_options(self) -> dict[str, Any]:
+        """Additional schema display config for engines with complex schemas"""
+        return self.get_extra().get("schema_options", {})
+
+    @property
+    def data(self) -> dict[str, Any]:
         return {
-            'id': self.id,
-            'name': self.database_name,
-            'backend': self.backend,
-            'allow_multi_schema_metadata_fetch':
-                self.allow_multi_schema_metadata_fetch,
-            'allows_subquery': self.allows_subquery,
+            "id": self.id,
+            "name": self.database_name,
+            "backend": self.backend,
+            "configuration_method": self.configuration_method,
+            "allows_subquery": self.allows_subquery,
+            "allows_cost_estimate": self.allows_cost_estimate,
+            "allows_virtual_table_explore": self.allows_virtual_table_explore,
+            "explore_database_id": self.explore_database_id,
+            "schema_options": self.schema_options,
+            "parameters": self.parameters,
+            "disable_data_preview": self.disable_data_preview,
+            "disable_drill_to_detail": self.disable_drill_to_detail,
+            "allow_multi_catalog": self.allow_multi_catalog,
+            "parameters_schema": self.parameters_schema,
+            "engine_information": self.engine_information,
         }
 
     @property
-    def unique_name(self):
+    def unique_name(self) -> str:
         return self.database_name
 
     @property
-    def url_object(self):
-        return make_url(self.sqlalchemy_uri_decrypted)
+    def url_object(self) -> URL:
+        return make_url_safe(self.sqlalchemy_uri_decrypted)
 
     @property
-    def backend(self):
-        url = make_url(self.sqlalchemy_uri_decrypted)
-        return url.get_backend_name()
+    def backend(self) -> str:
+        return self.url_object.get_backend_name()
 
     @property
-    def metadata_cache_timeout(self):
-        return self.get_extra().get('metadata_cache_timeout', {})
+    def driver(self) -> str:
+        return self.url_object.get_driver_name()
 
     @property
-    def schema_cache_enabled(self):
-        return 'schema_cache_timeout' in self.metadata_cache_timeout
+    def masked_encrypted_extra(self) -> str | None:
+        return self.db_engine_spec.mask_encrypted_extra(self.encrypted_extra)
 
     @property
-    def schema_cache_timeout(self):
-        return self.metadata_cache_timeout.get('schema_cache_timeout')
+    def parameters(self) -> dict[str, Any]:
+        # Database parameters are a dictionary of values that are used to make up
+        # the sqlalchemy_uri
+        # When returning the parameters we should use the masked SQLAlchemy URI and the
+        # masked ``encrypted_extra`` to prevent exposing sensitive credentials.
+        masked_uri = make_url_safe(self.sqlalchemy_uri)
+        encrypted_config = {}
+        if (masked_encrypted_extra := self.masked_encrypted_extra) is not None:
+            with suppress(TypeError, json.JSONDecodeError):
+                encrypted_config = json.loads(masked_encrypted_extra)
+        try:
+            # pylint: disable=useless-suppression
+            parameters = self.db_engine_spec.get_parameters_from_uri(  # type: ignore
+                masked_uri,
+                encrypted_extra=encrypted_config,
+            )
+        except Exception:  # pylint: disable=broad-except
+            parameters = {}
+
+        return parameters
 
     @property
-    def table_cache_enabled(self):
-        return 'table_cache_timeout' in self.metadata_cache_timeout
+    def parameters_schema(self) -> dict[str, Any]:
+        try:
+            parameters_schema = self.db_engine_spec.parameters_json_schema()  # type: ignore
+        except Exception:  # pylint: disable=broad-except
+            parameters_schema = {}
+        return parameters_schema
 
     @property
-    def table_cache_timeout(self):
-        return self.metadata_cache_timeout.get('table_cache_timeout')
+    def metadata_cache_timeout(self) -> dict[str, Any]:
+        return self.get_extra().get("metadata_cache_timeout", {})
+
+    @property
+    def catalog_cache_enabled(self) -> bool:
+        return "catalog_cache_timeout" in self.metadata_cache_timeout
+
+    @property
+    def catalog_cache_timeout(self) -> int | None:
+        return self.metadata_cache_timeout.get("catalog_cache_timeout")
+
+    @property
+    def schema_cache_enabled(self) -> bool:
+        return "schema_cache_timeout" in self.metadata_cache_timeout
+
+    @property
+    def schema_cache_timeout(self) -> int | None:
+        return self.metadata_cache_timeout.get("schema_cache_timeout")
+
+    @property
+    def table_cache_enabled(self) -> bool:
+        return "table_cache_timeout" in self.metadata_cache_timeout
+
+    @property
+    def table_cache_timeout(self) -> int | None:
+        return self.metadata_cache_timeout.get("table_cache_timeout")
+
+    @property
+    def default_schemas(self) -> list[str]:
+        return self.get_extra().get("default_schemas", [])
+
+    @property
+    def connect_args(self) -> dict[str, Any]:
+        return self.get_extra().get("engine_params", {}).get("connect_args", {})
+
+    @property
+    def engine_information(self) -> dict[str, Any]:
+        try:
+            engine_information = self.db_engine_spec.get_public_information()
+        except Exception:  # pylint: disable=broad-except
+            engine_information = {}
+        return engine_information
 
     @classmethod
-    def get_password_masked_url_from_uri(cls, uri):
-        url = make_url(uri)
-        return cls.get_password_masked_url(url)
+    def get_password_masked_url_from_uri(  # pylint: disable=invalid-name
+        cls, uri: str
+    ) -> URL:
+        sqlalchemy_url = make_url_safe(uri)
+        return cls.get_password_masked_url(sqlalchemy_url)
 
     @classmethod
-    def get_password_masked_url(cls, url):
-        url_copy = deepcopy(url)
-        if url_copy.password is not None and url_copy.password != PASSWORD_MASK:
-            url_copy.password = PASSWORD_MASK
+    def get_password_masked_url(cls, masked_url: URL) -> URL:
+        url_copy = deepcopy(masked_url)
+        if url_copy.password is not None:
+            url_copy = url_copy.set(password=PASSWORD_MASK)
         return url_copy
 
-    def set_sqlalchemy_uri(self, uri):
-        conn = sqla.engine.url.make_url(uri.strip())
+    def set_sqlalchemy_uri(self, uri: str) -> None:
+        conn = make_url_safe(uri.strip())
         if conn.password != PASSWORD_MASK and not custom_password_store:
             # do not over-write the password with the password mask
             self.password = conn.password
-        conn.password = PASSWORD_MASK if conn.password else None
+        conn = conn.set(password=PASSWORD_MASK if conn.password else None)
         self.sqlalchemy_uri = str(conn)  # hides the password
 
-    def get_effective_user(self, url, user_name=None):
+    def get_effective_user(self, object_url: URL) -> str | None:
         """
         Get the effective user, especially during impersonation.
-        :param url: SQL Alchemy URL object
-        :param user_name: Default username
+
+        :param object_url: SQL Alchemy URL object
         :return: The effective username
         """
-        effective_username = None
-        if self.impersonate_user:
-            effective_username = url.username
-            if user_name:
-                effective_username = user_name
-            elif (
-                hasattr(g, 'user') and hasattr(g.user, 'username') and
-                g.user.username is not None
-            ):
-                effective_username = g.user.username
-        return effective_username
 
-    @utils.memoized(
-        watch=('impersonate_user', 'sqlalchemy_uri_decrypted', 'extra'))
-    def get_sqla_engine(self, schema=None, nullpool=True, user_name=None, source=None):
-        extra = self.get_extra()
-        url = make_url(self.sqlalchemy_uri_decrypted)
-        url = self.db_engine_spec.adjust_database_uri(url, schema)
-        effective_username = self.get_effective_user(url, user_name)
-        # If using MySQL or Presto for example, will set url.username
-        # If using Hive, will not do anything yet since that relies on a
-        # configuration parameter instead.
-        self.db_engine_spec.modify_url_for_impersonation(
-            url,
-            self.impersonate_user,
-            effective_username)
-
-        masked_url = self.get_password_masked_url(url)
-        logging.info('Database.get_sqla_engine(). Masked URL: {0}'.format(masked_url))
-
-        params = extra.get('engine_params', {})
-        if nullpool:
-            params['poolclass'] = NullPool
-
-        # If using Hive, this will set hive.server2.proxy.user=$effective_username
-        configuration = {}
-        configuration.update(
-            self.db_engine_spec.get_configuration_for_impersonation(
-                str(url),
-                self.impersonate_user,
-                effective_username))
-        if configuration:
-            d = params.get('connect_args', {})
-            d['configuration'] = configuration
-            params['connect_args'] = d
-
-        DB_CONNECTION_MUTATOR = config.get('DB_CONNECTION_MUTATOR')
-        if DB_CONNECTION_MUTATOR:
-            url, params = DB_CONNECTION_MUTATOR(
-                url, params, effective_username, security_manager, source)
-        return create_engine(url, **params)
-
-    def get_reserved_words(self):
-        return self.get_dialect().preparer.reserved_words
-
-    def get_quoter(self):
-        return self.get_dialect().identifier_preparer.quote
-
-    def get_df(self, sql, schema, mutator=None):
-        sqls = [str(s).strip().strip(';') for s in sqlparse.parse(sql)]
-        source_key = None
-        if request and request.referrer:
-            if '/superset/dashboard/' in request.referrer:
-                source_key = 'dashboard'
-            elif '/superset/explore/' in request.referrer:
-                source_key = 'chart'
-        engine = self.get_sqla_engine(
-            schema=schema, source=utils.sources.get(source_key, None))
-        username = utils.get_username()
-
-        def needs_conversion(df_series):
-            if df_series.empty:
-                return False
-            if isinstance(df_series[0], (list, dict)):
-                return True
-            return False
-
-        def _log_query(sql):
-            if log_query:
-                log_query(engine.url, sql, schema, username, __name__, security_manager)
-
-        with closing(engine.raw_connection()) as conn:
-            with closing(conn.cursor()) as cursor:
-                for sql in sqls[:-1]:
-                    _log_query(sql)
-                    self.db_engine_spec.execute(cursor, sql)
-                    cursor.fetchall()
-
-                _log_query(sqls[-1])
-                self.db_engine_spec.execute(cursor, sqls[-1])
-
-                if cursor.description is not None:
-                    columns = [col_desc[0] for col_desc in cursor.description]
-                else:
-                    columns = []
-
-                df = pd.DataFrame.from_records(
-                    data=list(cursor.fetchall()),
-                    columns=columns,
-                    coerce_float=True,
-                )
-
-                if mutator:
-                    df = mutator(df)
-
-                for k, v in df.dtypes.items():
-                    if v.type == numpy.object_ and needs_conversion(df[k]):
-                        df[k] = df[k].apply(utils.json_dumps_w_dates)
-                return df
-
-    def compile_sqla_query(self, qry, schema=None):
-        engine = self.get_sqla_engine(schema=schema)
-
-        sql = str(
-            qry.compile(
-                engine,
-                compile_kwargs={'literal_binds': True},
-            ),
+        return (
+            username
+            if (username := get_username())
+            else object_url.username
+            if self.impersonate_user
+            else None
         )
 
-        if engine.dialect.identifier_preparer._double_percents:
-            sql = sql.replace('%%', '%')
+    @contextmanager
+    def get_sqla_engine(  # pylint: disable=too-many-arguments
+        self,
+        catalog: str | None = None,
+        schema: str | None = None,
+        nullpool: bool = True,
+        source: utils.QuerySource | None = None,
+        override_ssh_tunnel: SSHTunnel | None = None,
+    ) -> Engine:
+        """
+        Context manager for a SQLAlchemy engine.
+
+        This method will return a context manager for a SQLAlchemy engine. Using the
+        context manager (as opposed to the engine directly) is important because we need
+        to potentially establish SSH tunnels before the connection is created, and clean
+        them up once the engine is no longer used.
+        """
+        from superset.daos.database import (  # pylint: disable=import-outside-toplevel
+            DatabaseDAO,
+        )
+
+        sqlalchemy_uri = self.sqlalchemy_uri_decrypted
+
+        ssh_tunnel = override_ssh_tunnel or DatabaseDAO.get_ssh_tunnel(self.id)
+        ssh_context_manager = (
+            ssh_manager_factory.instance.create_tunnel(
+                ssh_tunnel=ssh_tunnel,
+                sqlalchemy_database_uri=sqlalchemy_uri,
+            )
+            if ssh_tunnel
+            else nullcontext()
+        )
+
+        with ssh_context_manager as ssh_context:
+            if ssh_context:
+                logger.info(
+                    "[SSH] Successfully created tunnel w/ %s tunnel_timeout + %s "
+                    "ssh_timeout at %s",
+                    sshtunnel.TUNNEL_TIMEOUT,
+                    sshtunnel.SSH_TIMEOUT,
+                    ssh_context.local_bind_address,
+                )
+                sqlalchemy_uri = ssh_manager_factory.instance.build_sqla_url(
+                    sqlalchemy_uri,
+                    ssh_context,
+                )
+
+            engine_context_manager = config["ENGINE_CONTEXT_MANAGER"]
+            with engine_context_manager(self, catalog, schema):
+                with check_for_oauth2(self):
+                    yield self._get_sqla_engine(
+                        catalog=catalog,
+                        schema=schema,
+                        nullpool=nullpool,
+                        source=source,
+                        sqlalchemy_uri=sqlalchemy_uri,
+                    )
+
+    def _get_sqla_engine(  # pylint: disable=too-many-locals  # noqa: C901
+        self,
+        catalog: str | None = None,
+        schema: str | None = None,
+        nullpool: bool = True,
+        source: utils.QuerySource | None = None,
+        sqlalchemy_uri: str | None = None,
+    ) -> Engine:
+        sqlalchemy_url = make_url_safe(
+            sqlalchemy_uri if sqlalchemy_uri else self.sqlalchemy_uri_decrypted
+        )
+        self.db_engine_spec.validate_database_uri(sqlalchemy_url)
+
+        extra = self.get_extra(source)
+        engine_kwargs = extra.get("engine_params", {})
+        if nullpool:
+            engine_kwargs["poolclass"] = NullPool
+        connect_args = engine_kwargs.setdefault("connect_args", {})
+
+        # modify URL/args for a specific catalog/schema
+        sqlalchemy_url, connect_args = self.db_engine_spec.adjust_engine_params(
+            uri=sqlalchemy_url,
+            connect_args=connect_args,
+            catalog=catalog,
+            schema=schema,
+        )
+
+        effective_username = self.get_effective_user(sqlalchemy_url)
+        if effective_username and is_feature_enabled("IMPERSONATE_WITH_EMAIL_PREFIX"):
+            user = security_manager.find_user(username=effective_username)
+            if user and user.email:
+                effective_username = user.email.split("@")[0]
+
+        oauth2_config = self.get_oauth2_config()
+        access_token = (
+            get_oauth2_access_token(
+                oauth2_config,
+                self.id,
+                g.user.id,
+                self.db_engine_spec,
+            )
+            if oauth2_config and hasattr(g, "user") and hasattr(g.user, "id")
+            else None
+        )
+        masked_url = self.get_password_masked_url(sqlalchemy_url)
+        logger.debug("Database._get_sqla_engine(). Masked URL: %s", str(masked_url))
+
+        if self.impersonate_user:
+            sqlalchemy_url, engine_kwargs = self.db_engine_spec.impersonate_user(
+                self,
+                effective_username,
+                access_token,
+                sqlalchemy_url,
+                engine_kwargs,
+            )
+
+        self.update_params_from_encrypted_extra(engine_kwargs)
+
+        if DB_CONNECTION_MUTATOR:
+            source = source or get_query_source_from_request()
+
+            sqlalchemy_url, engine_kwargs = DB_CONNECTION_MUTATOR(
+                sqlalchemy_url,
+                engine_kwargs,
+                effective_username,
+                security_manager,
+                source,
+            )
+        try:
+            return create_engine(sqlalchemy_url, **engine_kwargs)
+        except Exception as ex:
+            raise self.db_engine_spec.get_dbapi_mapped_exception(ex) from ex
+
+    def add_database_to_signature(
+        self,
+        func: Callable[..., None],
+        args: list[Any],
+    ) -> list[Any]:
+        """
+        Examines a function signature looking for a database param.
+        If the signature requires a database, the function appends self in the
+        proper position.
+        """
+
+        # PR #30674 changed the signature of the method to include database.
+        # This ensures that the change is backwards compatible
+        sig = signature(func)
+        if "database" in (params := sig.parameters.keys()):
+            args.insert(list(params).index("database"), self)
+        return args
+
+    @contextmanager
+    def get_raw_connection(
+        self,
+        catalog: str | None = None,
+        schema: str | None = None,
+        nullpool: bool = True,
+        source: utils.QuerySource | None = None,
+    ) -> Connection:
+        with self.get_sqla_engine(
+            catalog=catalog,
+            schema=schema,
+            nullpool=nullpool,
+            source=source,
+        ) as engine:
+            with check_for_oauth2(self):
+                with closing(engine.raw_connection()) as conn:
+                    # pre-session queries are used to set the selected catalog/schema
+                    for prequery in self.db_engine_spec.get_prequeries(
+                        database=self,
+                        catalog=catalog,
+                        schema=schema,
+                    ):
+                        cursor = conn.cursor()
+                        cursor.execute(prequery)
+
+                    yield conn
+
+    def get_default_catalog(self) -> str | None:
+        """
+        Return the default configured catalog for the database.
+        """
+        return self.db_engine_spec.get_default_catalog(self)
+
+    def get_default_schema(self, catalog: str | None) -> str | None:
+        """
+        Return the default schema for the database.
+        """
+        return self.db_engine_spec.get_default_schema(self, catalog)
+
+    def get_default_schema_for_query(self, query: Query) -> str | None:
+        """
+        Return the default schema for a given query.
+
+        This is used to determine if the user has access to a query that reads from table
+        names without a specific schema, eg:
+
+            SELECT * FROM `foo`
+
+        The schema of the `foo` table depends on the DB engine spec. Some DB engine specs
+        can change the default schema on a per-query basis; in other DB engine specs the
+        default schema is defined in the SQLAlchemy URI; and in others the default schema
+        might be determined by the database itself (like `public` for Postgres).
+        """  # noqa: E501
+        return self.db_engine_spec.get_default_schema_for_query(self, query)
+
+    @staticmethod
+    def post_process_df(df: pd.DataFrame) -> pd.DataFrame:
+        def column_needs_conversion(df_series: pd.Series) -> bool:
+            return (
+                not df_series.empty
+                and isinstance(df_series, pd.Series)
+                and isinstance(df_series[0], (list, dict))
+            )
+
+        for col, coltype in df.dtypes.to_dict().items():
+            if coltype == numpy.object_ and column_needs_conversion(df[col]):
+                df[col] = df[col].apply(json.json_dumps_w_dates)
+        return df
+
+    @property
+    def quote_identifier(self) -> Callable[[str], str]:
+        """Add quotes to potential identifier expressions if needed"""
+        return self.get_dialect().identifier_preparer.quote
+
+    def get_reserved_words(self) -> set[str]:
+        return self.get_dialect().preparer.reserved_words
+
+    def mutate_sql_based_on_config(self, sql_: str, is_split: bool = False) -> str:
+        """
+        Mutates the SQL query based on the app configuration.
+
+        Two config params here affect the behavior of the SQL query mutator:
+        - `SQL_QUERY_MUTATOR`: A user-provided function that mutates the SQL query.
+        - `MUTATE_AFTER_SPLIT`: If True, the SQL query mutator is only called after the
+          sql is broken down into smaller queries. If False, the SQL query mutator applies
+          on the group of queries as a whole. Here the called passes the context
+          as to whether the SQL is split or already.
+        """  # noqa: E501
+        sql_mutator = config["SQL_QUERY_MUTATOR"]
+        if sql_mutator and (is_split == config["MUTATE_AFTER_SPLIT"]):
+            return sql_mutator(
+                sql_,
+                security_manager=security_manager,
+                database=self,
+            )
+        return sql_
+
+    def get_df(
+        self,
+        sql: str,
+        catalog: str | None = None,
+        schema: str | None = None,
+        mutator: Callable[[pd.DataFrame], None] | None = None,
+    ) -> pd.DataFrame:
+        sqls = self.db_engine_spec.parse_sql(sql)
+        with self.get_sqla_engine(catalog=catalog, schema=schema) as engine:
+            engine_url = engine.url
+
+        def _log_query(sql: str) -> None:
+            if log_query:
+                log_query(
+                    engine_url,
+                    sql,
+                    schema,
+                    __name__,
+                    security_manager,
+                )
+
+        with self.get_raw_connection(catalog=catalog, schema=schema) as conn:
+            cursor = conn.cursor()
+            df = None
+            for i, sql_ in enumerate(sqls):
+                sql_ = self.mutate_sql_based_on_config(sql_, is_split=True)
+                _log_query(sql_)
+                with event_logger.log_context(
+                    action="execute_sql",
+                    database=self,
+                    object_ref=__name__,
+                ):
+                    self.db_engine_spec.execute(cursor, sql_, self)
+
+                rows = self.fetch_rows(cursor, i == len(sqls) - 1)
+                if rows is not None:
+                    df = self.load_into_dataframe(cursor.description, rows)
+
+            if mutator:
+                df = mutator(df)
+
+            return self.post_process_df(df)
+
+    @event_logger.log_this
+    def fetch_rows(self, cursor: Any, last: bool) -> list[tuple[Any, ...]] | None:
+        if not last:
+            cursor.fetchall()
+            return None
+
+        return self.db_engine_spec.fetch_data(cursor)
+
+    @event_logger.log_this
+    def load_into_dataframe(
+        self,
+        description: DbapiDescription,
+        data: list[tuple[Any, ...]],
+    ) -> pd.DataFrame:
+        result_set = SupersetResultSet(
+            data,
+            description,
+            self.db_engine_spec,
+        )
+        return result_set.to_pandas_df()
+
+    def compile_sqla_query(
+        self,
+        qry: Select,
+        catalog: str | None = None,
+        schema: str | None = None,
+        is_virtual: bool = False,
+    ) -> str:
+        with self.get_sqla_engine(catalog=catalog, schema=schema) as engine:
+            sql = str(qry.compile(engine, compile_kwargs={"literal_binds": True}))
+
+            # pylint: disable=protected-access
+            if engine.dialect.identifier_preparer._double_percents:  # noqa
+                sql = sql.replace("%%", "%")
+
+        # for nwo we only optimize queries on virtual datasources, since the only
+        # optimization available is predicate pushdown
+        if is_feature_enabled("OPTIMIZE_SQL") and is_virtual:
+            script = SQLScript(sql, self.db_engine_spec.engine).optimize()
+            sql = script.format()
 
         return sql
 
-    def select_star(
-            self, table_name, schema=None, limit=100, show_cols=False,
-            indent=True, latest_partition=False, cols=None):
+    def select_star(  # pylint: disable=too-many-arguments
+        self,
+        table: Table,
+        limit: int = 100,
+        show_cols: bool = False,
+        indent: bool = True,
+        latest_partition: bool = False,
+        cols: list[ResultSetColumnType] | None = None,
+    ) -> str:
         """Generates a ``select *`` statement in the proper dialect"""
-        eng = self.get_sqla_engine(
-            schema=schema, source=utils.sources.get('sql_lab', None))
-        return self.db_engine_spec.select_star(
-            self, table_name, schema=schema, engine=eng,
-            limit=limit, show_cols=show_cols,
-            indent=indent, latest_partition=latest_partition, cols=cols)
+        with self.get_sqla_engine(catalog=table.catalog, schema=table.schema) as engine:
+            return self.db_engine_spec.select_star(
+                self,
+                table,
+                engine=engine,
+                limit=limit,
+                show_cols=show_cols,
+                indent=indent,
+                latest_partition=latest_partition,
+                cols=cols,
+            )
 
-    def apply_limit_to_sql(self, sql, limit=1000):
-        return self.db_engine_spec.apply_limit_to_sql(sql, limit, self)
+    def apply_limit_to_sql(
+        self, sql: str, limit: int = 1000, force: bool = False
+    ) -> str:
+        if self.db_engine_spec.allow_limit_clause:
+            return self.db_engine_spec.apply_limit_to_sql(sql, limit, self, force=force)
+        return self.db_engine_spec.apply_top_to_sql(sql, limit)
 
-    def safe_sqlalchemy_uri(self):
+    def safe_sqlalchemy_uri(self) -> str:
         return self.sqlalchemy_uri
 
-    @property
-    def inspector(self):
-        engine = self.get_sqla_engine()
-        return sqla.inspect(engine)
-
     @cache_util.memoized_func(
-        key=lambda *args, **kwargs: 'db:{}:schema:None:table_list',
-        attribute_in_key='id')
-    def all_table_names_in_database(self, cache=False,
-                                    cache_timeout=None, force=False):
-        """Parameters need to be passed as keyword arguments."""
-        if not self.allow_multi_schema_metadata_fetch:
-            return []
-        return self.db_engine_spec.fetch_result_sets(self, 'table')
-
-    @cache_util.memoized_func(
-        key=lambda *args, **kwargs: 'db:{}:schema:None:view_list',
-        attribute_in_key='id')
-    def all_view_names_in_database(self, cache=False,
-                                   cache_timeout=None, force=False):
-        """Parameters need to be passed as keyword arguments."""
-        if not self.allow_multi_schema_metadata_fetch:
-            return []
-        return self.db_engine_spec.fetch_result_sets(self, 'view')
-
-    @cache_util.memoized_func(
-        key=lambda *args, **kwargs: 'db:{{}}:schema:{}:table_list'.format(
-            kwargs.get('schema')),
-        attribute_in_key='id')
-    def all_table_names_in_schema(self, schema, cache=False,
-                                  cache_timeout=None, force=False):
+        key="db:{self.id}:catalog:{catalog}:schema:{schema}:table_list",
+        cache=cache_manager.cache,
+    )
+    def get_all_table_names_in_schema(
+        self,
+        catalog: str | None,
+        schema: str,
+    ) -> set[tuple[str, str, str | None]]:
         """Parameters need to be passed as keyword arguments.
 
         For unused parameters, they are referenced in
         cache_util.memoized_func decorator.
 
+        :param catalog: optional catalog name
         :param schema: schema name
-        :type schema: str
         :param cache: whether cache is enabled for the function
-        :type cache: bool
         :param cache_timeout: timeout in seconds for the cache
-        :type cache_timeout: int
         :param force: whether to force refresh the cache
-        :type force: bool
-        :return: table list
-        :rtype: list
+        :return: The table/schema pairs
         """
-        tables = []
         try:
-            tables = self.db_engine_spec.get_table_names(
-                inspector=self.inspector, schema=schema)
-        except Exception as e:
-            logging.exception(e)
-        return tables
+            with self.get_inspector(catalog=catalog, schema=schema) as inspector:
+                return {
+                    (table, schema, catalog)
+                    for table in self.db_engine_spec.get_table_names(
+                        database=self,
+                        inspector=inspector,
+                        schema=schema,
+                    )
+                }
+        except Exception as ex:
+            raise self.db_engine_spec.get_dbapi_mapped_exception(ex) from ex
 
     @cache_util.memoized_func(
-        key=lambda *args, **kwargs: 'db:{{}}:schema:{}:view_list'.format(
-            kwargs.get('schema')),
-        attribute_in_key='id')
-    def all_view_names_in_schema(self, schema, cache=False,
-                                 cache_timeout=None, force=False):
+        key="db:{self.id}:catalog:{catalog}:schema:{schema}:view_list",
+        cache=cache_manager.cache,
+    )
+    def get_all_view_names_in_schema(
+        self,
+        catalog: str | None,
+        schema: str,
+    ) -> set[tuple[str, str, str | None]]:
         """Parameters need to be passed as keyword arguments.
 
         For unused parameters, they are referenced in
         cache_util.memoized_func decorator.
 
+        :param catalog: optional catalog name
         :param schema: schema name
-        :type schema: str
         :param cache: whether cache is enabled for the function
-        :type cache: bool
         :param cache_timeout: timeout in seconds for the cache
-        :type cache_timeout: int
         :param force: whether to force refresh the cache
-        :type force: bool
-        :return: view list
-        :rtype: list
+        :return: set of views
         """
-        views = []
         try:
-            views = self.db_engine_spec.get_view_names(
-                inspector=self.inspector, schema=schema)
-        except Exception as e:
-            logging.exception(e)
-        return views
+            with self.get_inspector(catalog=catalog, schema=schema) as inspector:
+                return {
+                    (view, schema, catalog)
+                    for view in self.db_engine_spec.get_view_names(
+                        database=self,
+                        inspector=inspector,
+                        schema=schema,
+                    )
+                }
+        except Exception as ex:
+            raise self.db_engine_spec.get_dbapi_mapped_exception(ex) from ex
+
+    @contextmanager
+    def get_inspector(
+        self,
+        catalog: str | None = None,
+        schema: str | None = None,
+        ssh_tunnel: SSHTunnel | None = None,
+    ) -> Inspector:
+        with self.get_sqla_engine(
+            catalog=catalog,
+            schema=schema,
+            override_ssh_tunnel=ssh_tunnel,
+        ) as engine:
+            yield sqla.inspect(engine)
 
     @cache_util.memoized_func(
-        key=lambda *args, **kwargs: 'db:{}:schema_list',
-        attribute_in_key='id')
-    def all_schema_names(self, cache=False, cache_timeout=None, force=False):
-        """Parameters need to be passed as keyword arguments.
+        key="db:{self.id}:catalog:{catalog}:schema_list",
+        cache=cache_manager.cache,
+    )
+    def get_all_schema_names(
+        self,
+        *,
+        catalog: str | None = None,
+        ssh_tunnel: SSHTunnel | None = None,
+    ) -> set[str]:
+        """
+        Return the schemas in a given database
 
-        For unused parameters, they are referenced in
-        cache_util.memoized_func decorator.
-
-        :param cache: whether cache is enabled for the function
-        :type cache: bool
-        :param cache_timeout: timeout in seconds for the cache
-        :type cache_timeout: int
-        :param force: whether to force refresh the cache
-        :type force: bool
+        :param catalog: override default catalog
+        :param ssh_tunnel: SSH tunnel information needed to establish a connection
         :return: schema list
-        :rtype: list
         """
-        return self.db_engine_spec.get_schema_names(self.inspector)
+        try:
+            with self.get_inspector(
+                catalog=catalog,
+                ssh_tunnel=ssh_tunnel,
+            ) as inspector:
+                return self.db_engine_spec.get_schema_names(inspector)
+        except Exception as ex:
+            if self.is_oauth2_enabled() and self.db_engine_spec.needs_oauth2(ex):
+                self.start_oauth2_dance()
+
+            raise self.db_engine_spec.get_dbapi_mapped_exception(ex) from ex
+
+    @cache_util.memoized_func(
+        key="db:{self.id}:catalog_list",
+        cache=cache_manager.cache,
+    )
+    def get_all_catalog_names(
+        self,
+        *,
+        ssh_tunnel: SSHTunnel | None = None,
+    ) -> set[str]:
+        """
+        Return the catalogs in a given database
+
+        :param ssh_tunnel: SSH tunnel information needed to establish a connection
+        :return: catalog list
+        """
+        try:
+            with self.get_inspector(ssh_tunnel=ssh_tunnel) as inspector:
+                return self.db_engine_spec.get_catalog_names(self, inspector)
+        except Exception as ex:
+            if self.is_oauth2_enabled() and self.db_engine_spec.needs_oauth2(ex):
+                self.start_oauth2_dance()
+
+            raise self.db_engine_spec.get_dbapi_mapped_exception(ex) from ex
 
     @property
-    def db_engine_spec(self):
-        return db_engine_specs.engines.get(
-            self.backend, db_engine_specs.BaseEngineSpec)
+    def db_engine_spec(self) -> builtins.type[db_engine_specs.BaseEngineSpec]:
+        url = make_url_safe(self.sqlalchemy_uri_decrypted)
+        return self.get_db_engine_spec(url)
 
     @classmethod
-    def get_db_engine_spec_for_backend(cls, backend):
-        return db_engine_specs.engines.get(backend, db_engine_specs.BaseEngineSpec)
+    @lru_cache(maxsize=LRU_CACHE_MAX_SIZE)
+    def get_db_engine_spec(
+        cls, url: URL
+    ) -> builtins.type[db_engine_specs.BaseEngineSpec]:
+        backend = url.get_backend_name()
+        try:
+            driver = url.get_driver_name()
+        except NoSuchModuleError:
+            # can't load the driver, fallback for backwards compatibility
+            driver = None
 
-    def grains(self):
+        return db_engine_specs.get_engine_spec(backend, driver)
+
+    def grains(self) -> tuple[TimeGrain, ...]:
         """Defines time granularity database-specific expressions.
 
         The idea here is to make it easy for users to change the time grain
-        form a datetime (maybe the source grain is arbitrary timestamps, daily
+        from a datetime (maybe the source grain is arbitrary timestamps, daily
         or 5 minutes increments) to another, "truncated" datetime. Since
         each database has slightly different but similar datetime functions,
         this allows a mapping between database engines and actual functions.
         """
         return self.db_engine_spec.get_time_grains()
 
-    def grains_dict(self):
-        """Allowing to lookup grain by either label or duration
+    def get_extra(self, source: utils.QuerySource | None = None) -> dict[str, Any]:
+        return self.db_engine_spec.get_extra_params(self, source)
 
-        For backward compatibility"""
-        d = {grain.duration: grain for grain in self.grains()}
-        d.update({grain.label: grain for grain in self.grains()})
-        return d
-
-    def get_extra(self):
-        extra = {}
-        if self.extra:
+    def get_encrypted_extra(self) -> dict[str, Any]:
+        encrypted_extra = {}
+        if self.encrypted_extra:
             try:
-                extra = json.loads(self.extra)
-            except Exception as e:
-                logging.error(e)
-                raise e
-        return extra
+                encrypted_extra = json.loads(self.encrypted_extra)
+            except json.JSONDecodeError as ex:
+                logger.error(ex, exc_info=True)
+                raise
+        return encrypted_extra
 
-    def get_table(self, table_name, schema=None):
+    # pylint: disable=invalid-name
+    def update_params_from_encrypted_extra(self, params: dict[str, Any]) -> None:
+        self.db_engine_spec.update_params_from_encrypted_extra(self, params)
+
+    def get_table(self, table: Table) -> SqlaTable:
         extra = self.get_extra()
-        meta = MetaData(**extra.get('metadata_params', {}))
-        return Table(
-            table_name, meta,
-            schema=schema or None,
-            autoload=True,
-            autoload_with=self.get_sqla_engine())
+        meta = MetaData(**extra.get("metadata_params", {}))
+        with self.get_sqla_engine(catalog=table.catalog, schema=table.schema) as engine:
+            return SqlaTable(
+                table.table,
+                meta,
+                schema=table.schema or None,
+                autoload=True,
+                autoload_with=engine,
+            )
 
-    def get_columns(self, table_name, schema=None):
-        return self.inspector.get_columns(table_name, schema)
+    def get_table_comment(self, table: Table) -> str | None:
+        with self.get_inspector(
+            catalog=table.catalog,
+            schema=table.schema,
+        ) as inspector:
+            return self.db_engine_spec.get_table_comment(inspector, table)
 
-    def get_indexes(self, table_name, schema=None):
-        return self.inspector.get_indexes(table_name, schema)
+    def get_columns(self, table: Table) -> list[ResultSetColumnType]:
+        with self.get_inspector(
+            catalog=table.catalog,
+            schema=table.schema,
+        ) as inspector:
+            return self.db_engine_spec.get_columns(
+                inspector, table, self.schema_options
+            )
 
-    def get_pk_constraint(self, table_name, schema=None):
-        return self.inspector.get_pk_constraint(table_name, schema)
+    def get_metrics(
+        self,
+        table: Table,
+    ) -> list[MetricType]:
+        with self.get_inspector(
+            catalog=table.catalog,
+            schema=table.schema,
+        ) as inspector:
+            return self.db_engine_spec.get_metrics(self, inspector, table)
 
-    def get_foreign_keys(self, table_name, schema=None):
-        return self.inspector.get_foreign_keys(table_name, schema)
+    def get_indexes(self, table: Table) -> list[dict[str, Any]]:
+        with self.get_inspector(
+            catalog=table.catalog,
+            schema=table.schema,
+        ) as inspector:
+            return self.db_engine_spec.get_indexes(self, inspector, table)
 
-    def get_schema_access_for_csv_upload(self):
-        return self.get_extra().get('schemas_allowed_for_csv_upload', [])
+    def get_pk_constraint(self, table: Table) -> dict[str, Any]:
+        with self.get_inspector(
+            catalog=table.catalog,
+            schema=table.schema,
+        ) as inspector:
+            pk_constraint = inspector.get_pk_constraint(table.table, table.schema) or {}
+
+            def _convert(value: Any) -> Any:
+                try:
+                    return json.base_json_conv(value)
+                except TypeError:
+                    return None
+
+            return {key: _convert(value) for key, value in pk_constraint.items()}
+
+    def get_foreign_keys(self, table: Table) -> list[dict[str, Any]]:
+        with self.get_inspector(
+            catalog=table.catalog,
+            schema=table.schema,
+        ) as inspector:
+            return inspector.get_foreign_keys(table.table, table.schema)
+
+    def get_schema_access_for_file_upload(  # pylint: disable=invalid-name
+        self,
+    ) -> set[str]:
+        allowed_databases = self.get_extra().get("schemas_allowed_for_file_upload", [])
+
+        if isinstance(allowed_databases, str):
+            allowed_databases = literal_eval(allowed_databases)
+
+        if hasattr(g, "user"):
+            extra_allowed_databases = config["ALLOWED_USER_CSV_SCHEMA_FUNC"](
+                self, g.user
+            )
+            allowed_databases += extra_allowed_databases
+        return set(allowed_databases)
 
     @property
-    def sqlalchemy_uri_decrypted(self):
-        conn = sqla.engine.url.make_url(self.sqlalchemy_uri)
+    def sqlalchemy_uri_decrypted(self) -> str:
+        try:
+            conn = make_url_safe(self.sqlalchemy_uri)
+        except DatabaseInvalidError:
+            # if the URI is invalid, ignore and return a placeholder url
+            # (so users see 500 less often)
+            return "dialect://invalid_uri"
         if custom_password_store:
-            conn.password = custom_password_store(conn)
+            conn = conn.set(password=custom_password_store(conn))
         else:
-            conn.password = self.password
+            conn = conn.set(password=self.password)
         return str(conn)
 
     @property
-    def sql_url(self):
-        return '/superset/sql/{}/'.format(self.id)
+    def sql_url(self) -> str:
+        return f"/superset/sql/{self.id}/"
 
-    def get_perm(self):
+    @hybrid_property
+    def perm(self) -> str:
+        return f"[{self.database_name}].(id:{self.id})"
+
+    @perm.expression  # type: ignore
+    def perm(cls) -> str:  # pylint: disable=no-self-argument  # noqa: N805
         return (
-            '[{obj.database_name}].(id:{obj.id})').format(obj=self)
+            "[" + cls.database_name + "].(id:" + expression.cast(cls.id, String) + ")"
+        )
 
-    def has_table(self, table):
-        engine = self.get_sqla_engine()
-        return engine.has_table(
-            table.table_name, table.schema or None)
+    def get_perm(self) -> str:
+        return self.perm
 
-    @utils.memoized
-    def get_dialect(self):
-        sqla_url = url.make_url(self.sqlalchemy_uri_decrypted)
+    def has_table(self, table: Table) -> bool:
+        with self.get_sqla_engine(catalog=table.catalog, schema=table.schema) as engine:
+            # do not pass "" as an empty schema; force null
+            return engine.has_table(table.table, table.schema or None)
+
+    def has_view(self, table: Table) -> bool:
+        with self.get_sqla_engine(catalog=table.catalog, schema=table.schema) as engine:
+            connection = engine.connect()
+            try:
+                views = engine.dialect.get_view_names(
+                    connection=connection,
+                    schema=table.schema,
+                )
+            except Exception:  # pylint: disable=broad-except
+                logger.warning("Has view failed", exc_info=True)
+                views = []
+
+        return table.table in views
+
+    def get_dialect(self) -> Dialect:
+        sqla_url = make_url_safe(self.sqlalchemy_uri_decrypted)
         return sqla_url.get_dialect()()
 
+    def make_sqla_column_compatible(
+        self, sqla_col: ColumnElement, label: str | None = None
+    ) -> ColumnElement:
+        """Takes a sqlalchemy column object and adds label info if supported by engine.
+        :param sqla_col: sqlalchemy column instance
+        :param label: alias/label that column is expected to have
+        :return: either a sql alchemy column or label instance if supported by engine
+        """
+        label_expected = label or sqla_col.name
+        # add quotes to tables
+        if self.db_engine_spec.get_allows_alias_in_select(self):
+            label = self.db_engine_spec.make_label_compatible(label_expected)
+            sqla_col = sqla_col.label(label)
+        sqla_col.key = label_expected
+        return sqla_col
 
-sqla.event.listen(Database, 'after_insert', security_manager.set_perm)
-sqla.event.listen(Database, 'after_update', security_manager.set_perm)
+    def is_oauth2_enabled(self) -> bool:
+        """
+        Is OAuth2 enabled in the database for authentication?
+
+        Currently this checks for configuration stored in the database `extra`, and then
+        for a global config at the DB engine spec level. In the future we want to allow
+        admins to create custom OAuth2 clients from the Superset UI, and assign them to
+        specific databases.
+        """
+        try:
+            client_config = self.get_oauth2_config()
+        except ValidationError:
+            logger.warning("Invalid OAuth2 client configuration for database %s", self)
+            client_config = None
+
+        return client_config is not None or self.db_engine_spec.is_oauth2_enabled()
+
+    def get_oauth2_config(self) -> OAuth2ClientConfig | None:
+        """
+        Return OAuth2 client configuration.
+
+        Currently this checks for configuration stored in the database `extra`, and then
+        for a global config at the DB engine spec level. In the future we want to allow
+        admins to create custom OAuth2 clients from the Superset UI, and assign them to
+        specific databases.
+        """
+        encrypted_extra = json.loads(self.encrypted_extra or "{}")
+        if oauth2_client_info := encrypted_extra.get("oauth2_client_info"):
+            schema = OAuth2ClientConfigSchema()
+            client_config = schema.load(oauth2_client_info)
+            return cast(OAuth2ClientConfig, client_config)
+
+        return self.db_engine_spec.get_oauth2_config()
+
+    def start_oauth2_dance(self) -> None:
+        """
+        Start the OAuth2 dance.
+
+        This method is called when an OAuth2 error is encountered, and the database is
+        configured to use OAuth2 for authentication. It raises an exception that will
+        trigger the OAuth2 dance in the frontend.
+        """
+        return self.db_engine_spec.start_oauth2_dance(self)
+
+    def purge_oauth2_tokens(self) -> None:
+        """
+        Delete all OAuth2 tokens associated with this database.
+
+        This is needed when the configuration changes. For example, a new client ID and
+        secret probably will require new tokens. The same is valid for changes in the
+        scope or in the endpoints.
+        """
+        db.session.query(DatabaseUserOAuth2Tokens).filter(
+            DatabaseUserOAuth2Tokens.id == self.id
+        ).delete()
 
 
-class Log(Model):
+sqla.event.listen(Database, "after_insert", security_manager.database_after_insert)
+sqla.event.listen(Database, "after_update", security_manager.database_after_update)
+sqla.event.listen(Database, "after_delete", security_manager.database_after_delete)
 
+
+class DatabaseUserOAuth2Tokens(Model, AuditMixinNullable):
+    """
+    Store OAuth2 tokens, for authenticating to DBs using user personal tokens.
+    """
+
+    __tablename__ = "database_user_oauth2_tokens"
+    __table_args__ = (sqla.Index("idx_user_id_database_id", "user_id", "database_id"),)
+
+    id = Column(Integer, primary_key=True)
+
+    user_id = Column(
+        Integer,
+        ForeignKey("ab_user.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    user = relationship(security_manager.user_model, foreign_keys=[user_id])
+
+    database_id = Column(
+        Integer,
+        ForeignKey("dbs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    database = relationship("Database", foreign_keys=[database_id])
+
+    access_token = Column(encrypted_field_factory.create(Text), nullable=True)
+    access_token_expiration = Column(DateTime, nullable=True)
+    refresh_token = Column(encrypted_field_factory.create(Text), nullable=True)
+
+
+class Log(Model):  # pylint: disable=too-few-public-methods
     """ORM object used to log Superset actions to the database"""
 
-    __tablename__ = 'logs'
+    __tablename__ = "logs"
 
     id = Column(Integer, primary_key=True)
     action = Column(String(512))
-    user_id = Column(Integer, ForeignKey('ab_user.id'))
+    user_id = Column(Integer, ForeignKey("ab_user.id"))
     dashboard_id = Column(Integer)
     slice_id = Column(Integer)
-    json = Column(Text)
+    json = Column(utils.MediumText())
     user = relationship(
-        security_manager.user_model, backref='logs', foreign_keys=[user_id])
+        security_manager.user_model, backref="logs", foreign_keys=[user_id]
+    )
     dttm = Column(DateTime, default=datetime.utcnow)
     duration_ms = Column(Integer)
     referrer = Column(String(1024))
 
-    @classmethod
-    def log_this(cls, f):
-        """Decorator to log user actions"""
-        @functools.wraps(f)
-        def wrapper(*args, **kwargs):
-            user_id = None
-            if g.user:
-                user_id = g.user.get_id()
-            d = request.form.to_dict() or {}
 
-            # request parameters can overwrite post body
-            request_params = request.args.to_dict()
-            d.update(request_params)
-            d.update(kwargs)
-
-            slice_id = d.get('slice_id')
-            dashboard_id = d.get('dashboard_id')
-
-            try:
-                slice_id = int(
-                    slice_id or json.loads(d.get('form_data')).get('slice_id'))
-            except (ValueError, TypeError):
-                slice_id = 0
-
-            stats_logger.incr(f.__name__)
-            start_dttm = datetime.now()
-            value = f(*args, **kwargs)
-            duration_ms = (datetime.now() - start_dttm).total_seconds() * 1000
-
-            # bulk insert
-            try:
-                explode_by = d.get('explode')
-                records = json.loads(d.get(explode_by))
-            except Exception:
-                records = [d]
-
-            referrer = request.referrer[:1000] if request.referrer else None
-            logs = []
-            for record in records:
-                try:
-                    json_string = json.dumps(record)
-                except Exception:
-                    json_string = None
-                log = cls(
-                    action=f.__name__,
-                    json=json_string,
-                    dashboard_id=dashboard_id,
-                    slice_id=slice_id,
-                    duration_ms=duration_ms,
-                    referrer=referrer,
-                    user_id=user_id)
-                logs.append(log)
-
-            sesh = db.session()
-            sesh.bulk_save_objects(logs)
-            sesh.commit()
-            return value
-
-        return wrapper
+class FavStarClassName(StrEnum):
+    CHART = "slice"
+    DASHBOARD = "Dashboard"
 
 
-class FavStar(Model):
-    __tablename__ = 'favstar'
+class FavStar(UUIDMixin, Model):
+    __tablename__ = "favstar"
 
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey('ab_user.id'))
+    user_id = Column(Integer, ForeignKey("ab_user.id"))
     class_name = Column(String(50))
     obj_id = Column(Integer)
     dttm = Column(DateTime, default=datetime.utcnow)
-
-
-class DatasourceAccessRequest(Model, AuditMixinNullable):
-    """ORM model for the access requests for datasources and dbs."""
-    __tablename__ = 'access_request'
-    id = Column(Integer, primary_key=True)
-
-    datasource_id = Column(Integer)
-    datasource_type = Column(String(200))
-
-    ROLES_BLACKLIST = set(config.get('ROBOT_PERMISSION_ROLES', []))
-
-    @property
-    def cls_model(self):
-        return ConnectorRegistry.sources[self.datasource_type]
-
-    @property
-    def username(self):
-        return self.creator()
-
-    @property
-    def datasource(self):
-        return self.get_datasource
-
-    @datasource.getter
-    @utils.memoized
-    def get_datasource(self):
-        # pylint: disable=no-member
-        ds = db.session.query(self.cls_model).filter_by(
-            id=self.datasource_id).first()
-        return ds
-
-    @property
-    def datasource_link(self):
-        return self.datasource.link  # pylint: disable=no-member
-
-    @property
-    def roles_with_datasource(self):
-        action_list = ''
-        perm = self.datasource.perm  # pylint: disable=no-member
-        pv = security_manager.find_permission_view_menu('datasource_access', perm)
-        for r in pv.role:
-            if r.name in self.ROLES_BLACKLIST:
-                continue
-            # pylint: disable=no-member
-            url = (
-                f'/superset/approve?datasource_type={self.datasource_type}&'
-                f'datasource_id={self.datasource_id}&'
-                f'created_by={self.created_by.username}&role_to_grant={r.name}'
-            )
-            href = '<a href="{}">Grant {} Role</a>'.format(url, r.name)
-            action_list = action_list + '<li>' + href + '</li>'
-        return '<ul>' + action_list + '</ul>'
-
-    @property
-    def user_roles(self):
-        action_list = ''
-        for r in self.created_by.roles:  # pylint: disable=no-member
-            # pylint: disable=no-member
-            url = (
-                f'/superset/approve?datasource_type={self.datasource_type}&'
-                f'datasource_id={self.datasource_id}&'
-                f'created_by={self.created_by.username}&role_to_extend={r.name}'
-            )
-            href = '<a href="{}">Extend {} Role</a>'.format(url, r.name)
-            if r.name in self.ROLES_BLACKLIST:
-                href = '{} Role'.format(r.name)
-            action_list = action_list + '<li>' + href + '</li>'
-        return '<ul>' + action_list + '</ul>'
-
-
-# events for updating tags
-sqla.event.listen(Slice, 'after_insert', ChartUpdater.after_insert)
-sqla.event.listen(Slice, 'after_update', ChartUpdater.after_update)
-sqla.event.listen(Slice, 'after_delete', ChartUpdater.after_delete)
-sqla.event.listen(Dashboard, 'after_insert', DashboardUpdater.after_insert)
-sqla.event.listen(Dashboard, 'after_update', DashboardUpdater.after_update)
-sqla.event.listen(Dashboard, 'after_delete', DashboardUpdater.after_delete)
-sqla.event.listen(FavStar, 'after_insert', FavStarUpdater.after_insert)
-sqla.event.listen(FavStar, 'after_delete', FavStarUpdater.after_delete)

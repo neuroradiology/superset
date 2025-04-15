@@ -61,7 +61,7 @@ else
     declare java_cmd=java
 fi
 
-export RAT_VERSION=0.13
+export RAT_VERSION=0.16.1
 export rat_jar="${TMP_DIR}"/lib/apache-rat-${RAT_VERSION}.jar
 mkdir -p ${TMP_DIR}/lib
 
@@ -70,9 +70,6 @@ mkdir -p ${TMP_DIR}/lib
     echo "Download failed. Obtain the rat jar manually and place it at $rat_jar"
     exit 1
 }
-
-# This is the target of a symlink in superset/assets/docs - and rat exclude doesn't cope with the symlink target doesn't exist
-mkdir -p docs/_build/html/
 
 echo "Running license checks. This can take a while."
 echo "$FWDIR"/.rat-excludes

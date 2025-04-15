@@ -16,9 +16,19 @@
   specific language governing permissions and limitations
   under the License.
 #}
-<script>
+{% import "superset/macros.html" as macros %}
+<script nonce="{{ macros.get_nonce() }}">
     window.onload = function() {
-        window.open(window.location += '&action=go', '_blank');
+
+        // See issue #7353, window.open fails
+        var a = document.createElement('a');
+        a.href = window.location + '&action=go';
+        a.download = 'dashboards.json';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+
         window.location = '{{ dashboards_url }}';
+
     };
 </script>
